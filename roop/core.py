@@ -1,77 +1,59 @@
 #!/usr/bin/env python3
 
-import os
-import sys
-# single thread doubles performance of gpu-mode - needs to be set before torch import
-if any(arg.startswith('--gpu-vendor') for arg in sys.argv):
-    os.environ['OMP_NUM_THREADS'] = '1'
 import platform
 import signal
+import sys
 import shutil
 import glob
 import argparse
-import psutil
-import torch
-import tensorflow
-from pathlib import Path
 import multiprocessing as mp
+import os
+import torch
+from pathlib import Path
+import tkinter as tk
+from tkinter import filedialog
+from tkinter.filedialog import asksaveasfilename
+import webbrowser
+import psutil
 import cv2
+import threading
+from PIL import Image, ImageTk
+from roop.gpu_optimizer import process_video_gpu
 
 import roop.globals
-from roop.swapper import process_video, process_img, process_faces, process_frames
-from roop.utils import is_img, detect_fps, set_fps, create_video, add_audio, extract_frames, rreplace
+from roop.swapper import process_video, process_img
+from roop.utils import is_img, detect_fps, set_fps, create_video, add_audio, extract_frames, rreplace, conditional_download
 from roop.analyser import get_face_single
-import roop.ui as ui
+
+if 'ROCMExecutionProvider' in roop.globals.providers:
+    del torch
+
+pool = None
+args = {}
 
 signal.signal(signal.SIGINT, lambda signal_number, frame: quit())
 parser = argparse.ArgumentParser()
 parser.add_argument('-f', '--face', help='use this face', dest='source_img')
 parser.add_argument('-t', '--target', help='replace this face', dest='target_path')
 parser.add_argument('-o', '--output', help='save output to this file', dest='output_file')
+parser.add_argument('--gpu', help='use gpu', dest='gpu', action='store_true', default=False)
 parser.add_argument('--keep-fps', help='maintain original fps', dest='keep_fps', action='store_true', default=False)
 parser.add_argument('--keep-frames', help='keep frames directory', dest='keep_frames', action='store_true', default=False)
+parser.add_argument('--max-memory', help='maximum amount of RAM in GB to be used', type=int)
+parser.add_argument('--max-cores', help='number of cores to be use for CPU mode', dest='cores_count', type=int, default=max(psutil.cpu_count() - 2, 2))
 parser.add_argument('--all-faces', help='swap all faces in frame', dest='all_faces', action='store_true', default=False)
-parser.add_argument('--max-memory', help='maximum amount of RAM in GB to be used', dest='max_memory', type=int)
-parser.add_argument('--cpu-cores', help='number of CPU cores to use', dest='cpu_cores', type=int, default=max(psutil.cpu_count() / 2, 1))
-parser.add_argument('--gpu-threads', help='number of threads to be use for the GPU', dest='gpu_threads', type=int, default=8)
-parser.add_argument('--gpu-vendor', help='choice your GPU vendor', dest='gpu_vendor', choices=['apple', 'amd', 'intel', 'nvidia'])
+parser.add_argument('--gpu-threads', help='number of threads for gpu to run in parallel', dest='gpu_threads', type=int, default=4)
+parser.add_argument('--codec', help='video encoder (libx264 or libx265)', dest='codec', default='libx264', choices=['libx264', 'libx265'])
+for name, value in vars(parser.parse_args()).items():
+    args[name] = value
 
-args = parser.parse_known_args()[0]
-
-if 'all_faces' in args:
+if '--all-faces' in sys.argv or '-a' in sys.argv:
     roop.globals.all_faces = True
-
-if args.cpu_cores:
-    roop.globals.cpu_cores = int(args.cpu_cores)
-
-# cpu thread fix for mac
-if sys.platform == 'darwin':
-    roop.globals.cpu_cores = 1
-
-if args.gpu_threads:
-    roop.globals.gpu_threads = int(args.gpu_threads)
-
-# gpu thread fix for amd
-if args.gpu_vendor == 'amd':
-    roop.globals.gpu_threads = 1
-
-if args.gpu_vendor:
-    roop.globals.gpu_vendor = args.gpu_vendor
-else:
-    roop.globals.providers = ['CPUExecutionProvider']
-
-sep = "/"
-if os.name == "nt":
-    sep = "\\"
 
 
 def limit_resources():
-    # prevent tensorflow memory leak
-    gpus = tensorflow.config.experimental.list_physical_devices('GPU')
-    for gpu in gpus:
-        tensorflow.config.experimental.set_memory_growth(gpu, True)
-    if args.max_memory:
-        memory = args.max_memory * 1024 * 1024 * 1024
+    if args['max_memory']:
+        memory = args['max_memory'] * 1024 * 1024 * 1024
         if str(platform.system()).lower() == 'windows':
             import ctypes
             kernel32 = ctypes.windll.kernel32
@@ -86,185 +68,254 @@ def pre_check():
         quit('Python version is not supported - please upgrade to 3.9 or higher')
     if not shutil.which('ffmpeg'):
         quit('ffmpeg is not installed!')
-    model_path = os.path.join(os.path.abspath(os.path.dirname(__file__)), '../inswapper_128.onnx')
-    if not os.path.isfile(model_path):
-        quit('File "inswapper_128.onnx" does not exist!')
-    if roop.globals.gpu_vendor == 'apple':
-        if 'CoreMLExecutionProvider' not in roop.globals.providers:
-            quit("You are using --gpu=apple flag but CoreML isn't available or properly installed on your system.")
-    if roop.globals.gpu_vendor == 'amd':
-        if 'ROCMExecutionProvider' not in roop.globals.providers:
-            quit("You are using --gpu=amd flag but ROCM isn't available or properly installed on your system.")
-    if roop.globals.gpu_vendor == 'nvidia':
-        CUDA_VERSION = torch.version.cuda
-        CUDNN_VERSION = torch.backends.cudnn.version()
-        if not torch.cuda.is_available():
-            quit("You are using --gpu=nvidia flag but CUDA isn't available or properly installed on your system.")
-        if CUDA_VERSION > '11.8':
-            quit(f"CUDA version {CUDA_VERSION} is not supported - please downgrade to 11.8")
-        if CUDA_VERSION < '11.4':
-            quit(f"CUDA version {CUDA_VERSION} is not supported - please upgrade to 11.8")
-        if CUDNN_VERSION < 8220:
-            quit(f"CUDNN version {CUDNN_VERSION} is not supported - please upgrade to 8.9.1")
-        if CUDNN_VERSION > 8910:
-            quit(f"CUDNN version {CUDNN_VERSION} is not supported - please downgrade to 8.9.1")
+    if '--gpu' in sys.argv:
+        NVIDIA_PROVIDERS = ['CUDAExecutionProvider', 'TensorrtExecutionProvider']
+        if len(list(set(roop.globals.providers) - set(NVIDIA_PROVIDERS))) == 1:
+            CUDA_VERSION = torch.version.cuda
+            CUDNN_VERSION = torch.backends.cudnn.version()
+            if not torch.cuda.is_available() or not CUDA_VERSION:
+                quit("You are using --gpu flag but CUDA isn't available or properly installed on your system.")
+            if CUDA_VERSION > '11.8':
+                quit(f"CUDA version {CUDA_VERSION} is not supported - please downgrade to 11.8")
+            if CUDA_VERSION < '11.4':
+                quit(f"CUDA version {CUDA_VERSION} is not supported - please upgrade to 11.8")
+            if CUDNN_VERSION < 8220:
+                quit(f"CUDNN version {CUDNN_VERSION} is not supported - please upgrade to 8.9.1")
+            if CUDNN_VERSION > 8910:
+                quit(f"CUDNN version {CUDNN_VERSION} is not supported - please downgrade to 8.9.1")
+    else:
+        roop.globals.providers = ['CPUExecutionProvider']
+    if '--all-faces' in sys.argv or '-a' in sys.argv:
+        roop.globals.all_faces = True
 
 
-def get_video_frame(video_path, frame_number = 1):
-    cap = cv2.VideoCapture(video_path)
-    amount_of_frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
-    cap.set(cv2.CAP_PROP_POS_FRAMES, min(amount_of_frames, frame_number-1))
-    if not cap.isOpened():
-        print("Error opening video file")
+def start_processing(fps, target_path):
+    if args['gpu']:
+        process_video_gpu(args['source_img'], 
+                          target_path, 
+                          os.path.dirname(target_path), 
+                          fps, 
+                          int(args['gpu_threads']),
+                          roop.globals.all_faces,
+                          codec = args['codec'])
+        if args['keep_frames']:
+            target_dir = os.path.dirname(args['target_path'])
+            os.makedirs(os.path.join(target_dir, "output_frames"), exist_ok=True)
+            extract_frames(os.path.join(target_dir, 'output.mp4'), os.path.join(target_dir, "output_frames"))
         return
-    ret, frame = cap.read()
-    if ret:
-        return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    frame_paths = args["frame_paths"]
+    n = len(frame_paths)//(args['cores_count'])
+    processes = []
+    for i in range(0, len(frame_paths), n):
+        p = pool.apply_async(process_video, args=(args['source_img'], frame_paths[i:i+n],))
+        processes.append(p)
+    for p in processes:
+        p.get()
+    pool.close()
+    pool.join()
 
-    cap.release()
+
+def preview_image(image_path):
+    img = Image.open(image_path)
+    img = img.resize((180, 180), Image.ANTIALIAS)
+    photo_img = ImageTk.PhotoImage(img)
+    left_frame = tk.Frame(window)
+    left_frame.place(x=60, y=100)
+    img_label = tk.Label(left_frame, image=photo_img)
+    img_label.image = photo_img
+    img_label.pack()
 
 
 def preview_video(video_path):
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         print("Error opening video file")
-        return 0
-    amount_of_frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+        return
     ret, frame = cap.read()
     if ret:
-        frame = get_video_frame(video_path)
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        img = Image.fromarray(frame)
+        img = img.resize((180, 180), Image.ANTIALIAS)
+        photo_img = ImageTk.PhotoImage(img)
+        right_frame = tk.Frame(window)
+        right_frame.place(x=360, y=100)
+        img_label = tk.Label(right_frame, image=photo_img)
+        img_label.image = photo_img
+        img_label.pack()
 
     cap.release()
-    return (amount_of_frames, frame)
+
+
+def select_face():
+    args['source_img'] = filedialog.askopenfilename(title="Select a face")
+    preview_image(args['source_img'])
+
+
+def select_target():
+    args['target_path'] = filedialog.askopenfilename(title="Select a target")
+    threading.Thread(target=preview_video, args=(args['target_path'],)).start()
+
+
+def toggle_fps_limit():
+    args['keep_fps'] = int(limit_fps.get() != True)
+
+
+def toggle_all_faces():
+    roop.globals.all_faces = True if all_faces.get() == 1 else False
+
+
+def toggle_keep_frames():
+    args['keep_frames'] = int(keep_frames.get())
+
+def toggle_row_demo_render():
+    #args['keep_frames'] = int(keep_frames.get())
+    global videoproc
+    videoproc.is_demo_row_render = videoproc.plugin_options("core")["is_demo_row_render"] = row_demo_render.get() == 1
+    videoproc.save_plugin_options("core",videoproc.plugin_options("core"))
+    print(videoproc.plugin_options("core"))
+
+def save_file():
+    filename, ext = 'output.mp4', '.mp4'
+    if is_img(args['target_path']):
+        filename, ext = 'output.png', '.png'
+    args['output_file'] = asksaveasfilename(initialfile=filename, defaultextension=ext, filetypes=[("All Files","*.*"),("Videos","*.mp4")])
 
 
 def status(string):
-    value = "Status: " + string
     if 'cli_mode' in args:
-        print(value)
+        print("Status: " + string)
     else:
-        ui.update_status_label(value)
+        status_label["text"] = "Status: " + string
+        window.update()
 
 
-def process_video_multi_cores(source_img, frame_paths):
-    n = len(frame_paths) // roop.globals.cpu_cores
-    if n > 2:
-        processes = []
-        for i in range(0, len(frame_paths), n):
-            p = POOL.apply_async(process_video, args=(source_img, frame_paths[i:i + n],))
-            processes.append(p)
-        for p in processes:
-            p.get()
-        POOL.close()
-        POOL.join()
-
-
-def start(preview_callback = None):
-    if not args.source_img or not os.path.isfile(args.source_img):
+def start():
+    if not args['source_img'] or not os.path.isfile(args['source_img']):
         print("\n[WARNING] Please select an image containing a face.")
         return
-    elif not args.target_path or not os.path.isfile(args.target_path):
+    elif not args['target_path'] or not os.path.isfile(args['target_path']):
         print("\n[WARNING] Please select a video/image to swap face in.")
         return
-    if not args.output_file:
-        target_path = args.target_path
-        args.output_file = rreplace(target_path, "/", "/swapped-", 1) if "/" in target_path else "swapped-" + target_path
-    target_path = args.target_path
-    test_face = get_face_single(cv2.imread(args.source_img))
+    global pool
+    pool = mp.Pool(args['cores_count'])
+    target_path = args['target_path']
+    if not args['output_file']:
+        args['output_file'] = rreplace(path=target_path, prefix="swapped-", postfix=".mp4")
+    test_face = get_face_single(cv2.imread(args['source_img']))
     if not test_face:
         print("\n[WARNING] No face detected in source image. Please try with another one.\n")
         return
-    video_name_full = target_path.split("/")[-1]
+    if is_img(target_path):
+        if predict_image(target_path) > 0.85:
+            quit()
+        process_img(args['source_img'], target_path, args['output_file'])
+        status("swap successful!")
+        return
+    seconds, probabilities = predict_video_frames(video_path=args['target_path'], frame_interval=100)
+    if any(probability > 0.85 for probability in probabilities):
+        quit()
+    video_name_full = os.path.basename(target_path)
     video_name = os.path.splitext(video_name_full)[0]
-    output_dir = os.path.dirname(target_path) + "/" + video_name if os.path.dirname(target_path) else video_name
-    Path(output_dir).mkdir(exist_ok=True)
+    output_dir = os.path.join(os.path.dirname(target_path), video_name)
+    if output_dir.startswith("/"):
+        output_dir = "." + output_dir
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
     status("detecting video's FPS...")
     fps, exact_fps = detect_fps(target_path)
-    if not args.keep_fps and fps > 30:
-        this_path = output_dir + "/" + video_name + ".mp4"
+    exact_fps = int(exact_fps.split("/")[0])/ int(exact_fps.split("/")[1])
+    if not args['keep_fps'] and fps > 30:
+        this_path = os.path.join(output_dir, video_name+".mp4")
         set_fps(target_path, this_path, 30)
         target_path, exact_fps = this_path, 30
     else:
         shutil.copy(target_path, output_dir)
-    status("extracting frames...")
-    extract_frames(target_path, output_dir)
-    args.frame_paths = tuple(sorted(
-        glob.glob(output_dir + "/*.png"),
-        key=lambda x: int(x.split(sep)[-1].replace(".png", ""))
-    ))
+        target_path = os.path.join(output_dir, video_name_full)
+    if not args['gpu']:
+        status("extracting frames...")
+        extract_frames(target_path, output_dir)
+        args['frame_paths'] = tuple(sorted(
+            glob.glob("*.png", root_dir=output_dir),
+            key=lambda x: int(x.replace(".png", ""))
+        ))
     status("swapping in progress...")
-    if roop.globals.gpu_vendor is None and roop.globals.cpu_cores > 1:
-        global POOL
-        POOL = mp.Pool(roop.globals.cpu_cores)
-        process_video_multi_cores(args.source_img, args.frame_paths)
-    else:
-        process_video(args.source_img, args.frame_paths)
+    start_processing(exact_fps, target_path)
     status("creating video...")
-    create_video(video_name, exact_fps, output_dir)
+    if not args['gpu']:
+        create_video(video_name, exact_fps, output_dir)
     status("adding audio...")
-    add_audio(output_dir, target_path, video_name_full, args.keep_frames, args.output_file)
-    save_path = args.output_file if args.output_file else output_dir + "/" + video_name + ".mp4"
+    if args['gpu']:
+        add_audio(os.path.join(os.path.dirname(target_path)), target_path, video_name_full, args['keep_frames'], args['output_file'], gpu=args['gpu'])
+    else:
+        add_audio(output_dir, target_path, video_name_full, args['keep_frames'], args['output_file'], gpu=False)
+    save_path = args['output_file'] if args['output_file'] else os.path.join(output_dir, video_name+".mp4")
     print("\n\nVideo saved as:", save_path, "\n\n")
     status("swap successful!")
 
 
-def select_face_handler(path: str):
-    args.source_img = path
-
-
-def select_target_handler(path: str):
-    args.target_path = path
-    return preview_video(args.target_path)
-
-
-def toggle_all_faces_handler(value: int):
-    roop.globals.all_faces = True if value == 1 else False
-
-
-def toggle_fps_limit_handler(value: int):
-    args.keep_fps = int(value != 1)
-
-
-def toggle_keep_frames_handler(value: int):
-    args.keep_frames = value
-
-
-def save_file_handler(path: str):
-    args.output_file = path
-
-
-def create_test_preview(frame_number):
-    return process_faces(
-        get_face_single(cv2.imread(args.source_img)),
-        get_video_frame(args.target_path, frame_number)
-    )
-
-
 def run():
-    global all_faces, keep_frames, limit_fps
+    global status_label, window, all_faces, limit_fps, keep_frames, row_demo_render, videoproc
 
+    from chain_img_processor import get_single_video_processor
+    videoproc = get_single_video_processor() # get processor to warmup
+
+
+    conditional_download(os.path.join(os.path.abspath(os.path.dirname(__file__)), "..", "models"), ["https://huggingface.co/deepinsight/inswapper/resolve/main/inswapper_128.onnx"])
+    # side-note: this huggingface account isn't owned by insightface, see: https://github.com/deepinsight/insightface/issues/2339
     pre_check()
     limit_resources()
-    if args.source_img:
-        args.cli_mode = True
+
+    if args['source_img']:
+        args['cli_mode'] = True
         start()
         quit()
+    window = tk.Tk()
+    window.geometry("600x700")
+    window.title("roop")
+    window.configure(bg="#2d3436")
+    window.resizable(width=False, height=False)
 
-    window = ui.init(
-        {
-            'all_faces': roop.globals.all_faces,
-            'keep_fps': args.keep_fps,
-            'keep_frames': args.keep_frames
-        },
-        select_face_handler,
-        select_target_handler,
-        toggle_all_faces_handler,
-        toggle_fps_limit_handler,
-        toggle_keep_frames_handler,
-        save_file_handler,
-        start,
-        get_video_frame,
-        create_test_preview
-    )
+    # Contact information
+    support_link = tk.Label(window, text="Donate to project <3", fg="#fd79a8", bg="#2d3436", cursor="hand2", font=("Arial", 8))
+    support_link.place(x=180,y=20,width=250,height=30)
+    support_link.bind("<Button-1>", lambda e: webbrowser.open("https://github.com/sponsors/s0md3v"))
+
+    # Select a face button
+    face_button = tk.Button(window, text="Select a face", command=select_face, bg="#2d3436", fg="#74b9ff", highlightthickness=4, relief="flat", highlightbackground="#74b9ff", activebackground="#74b9ff", borderwidth=4)
+    face_button.place(x=60,y=320,width=180,height=80)
+
+    # Select a target button
+    target_button = tk.Button(window, text="Select a target", command=select_target, bg="#2d3436", fg="#74b9ff", highlightthickness=4, relief="flat", highlightbackground="#74b9ff", activebackground="#74b9ff", borderwidth=4)
+    target_button.place(x=360,y=320,width=180,height=80)
+
+    # All faces checkbox
+    all_faces = tk.IntVar()
+    all_faces_checkbox = tk.Checkbutton(window, anchor="w", relief="groove", activebackground="#2d3436", activeforeground="#74b9ff", selectcolor="black", text="Process all faces in frame", fg="#dfe6e9", borderwidth=0, highlightthickness=0, bg="#2d3436", variable=all_faces, command=toggle_all_faces)
+    all_faces_checkbox.place(x=60,y=500,width=240,height=31)
+
+    # FPS limit checkbox
+    limit_fps = tk.IntVar(None, not args['keep_fps'])
+    fps_checkbox = tk.Checkbutton(window, anchor="w", relief="groove", activebackground="#2d3436", activeforeground="#74b9ff", selectcolor="black", text="Limit FPS to 30", fg="#dfe6e9", borderwidth=0, highlightthickness=0, bg="#2d3436", variable=limit_fps, command=toggle_fps_limit)
+    fps_checkbox.place(x=60,y=475,width=240,height=31)
+
+    # Keep frames checkbox
+    keep_frames = tk.IntVar(None, args['keep_frames'])
+    frames_checkbox = tk.Checkbutton(window, anchor="w", relief="groove", activebackground="#2d3436", activeforeground="#74b9ff", selectcolor="black", text="Keep frames dir", fg="#dfe6e9", borderwidth=0, highlightthickness=0, bg="#2d3436", variable=keep_frames, command=toggle_keep_frames)
+    frames_checkbox.place(x=60,y=450,width=240,height=31)
+
+    # Make demo row video checkbox
+    row_demo_render = tk.IntVar(None, value=1 if videoproc.plugin_options("core").get("is_demo_row_render") else 0)
+    row_demo_render_checkbox = tk.Checkbutton(window, anchor="w", relief="groove", activebackground="#2d3436",
+                                     activeforeground="#74b9ff", selectcolor="black", text="Render video with stages in a row",
+                                     fg="#dfe6e9", borderwidth=0, highlightthickness=0, bg="#2d3436",
+                                     variable=row_demo_render, command=toggle_row_demo_render)
+    row_demo_render_checkbox.place(x=60, y=525, width=240, height=31)
+
+    # Start button
+    start_button = tk.Button(window, text="Start", bg="#f1c40f", relief="flat", borderwidth=0, highlightthickness=0, command=lambda: [save_file(), start()])
+    start_button.place(x=240,y=560,width=120,height=49)
+
+    # Status label
+    status_label = tk.Label(window, width=580, justify="center", text="Status: waiting for input...", fg="#2ecc71", bg="#2d3436")
+    status_label.place(x=10,y=640,width=580,height=30)
 
     window.mainloop()
